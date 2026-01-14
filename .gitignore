@@ -1,0 +1,15 @@
+# 🔐 Secrets
+serviceAccount.json
+.env
+.env.local
+*.env
+
+# 🔥 Firebase / GCP
+firebase-adminsdk-*.json
+
+# 🐍 Python
+__pycache__/
+*.pyc
+
+# Streamlit
+.streamlit/secrets.toml
