@@ -277,164 +277,258 @@ with st.expander("📂 Manage Categories", expanded=False):
             st.warning("⚠️ Please enter a category name")
 
 # =====================================================
-# UPLOAD GAME
+# HELPER FUNCTION FOR GAME UPLOAD
 # =====================================================
-st.markdown('<div class="section-header">⬆️ Upload New Game</div>', unsafe_allow_html=True)
+def process_single_game(title, zip_file_content, category_id, zip_filename=""):
+    """Process and upload a single game. Returns (success, message)"""
+    try:
+        slug = slugify(title)
+        
+        # Check if game exists and get its document
+        existing_games = list(db.collection("games").where("titleNormalized", "==", title.lower()).stream())
+        game_exists = len(existing_games) > 0
+        
+        if game_exists:
+            st.warning(f"⚠️ Game '{title}' already exists. Replacing...")
+            existing_game = existing_games[0]
+            existing_slug = existing_game.to_dict().get("slug", slug)
+            
+            # Delete old files from GitHub
+            try:
+                old_files = list_files(existing_slug)
+                for f in old_files:
+                    delete_file(f["path"], f["sha"])
+                st.info(f"🗑️ Deleted {len(old_files)} old file(s) for '{title}'")
+            except Exception as e:
+                st.warning(f"⚠️ Could not delete old files: {str(e)}")
+        
+        # Ensure tmp directory exists
+        if not os.path.exists("tmp"):
+            os.makedirs("tmp")
+        
+        tmp_dir = f"tmp/{slug}"
+        os.makedirs(tmp_dir, exist_ok=True)
+
+        # Extract ZIP file
+        zip_path = f"{tmp_dir}.zip"
+        with open(zip_path, "wb") as f:
+            f.write(zip_file_content)
+
+        with zipfile.ZipFile(zip_path) as z:
+            z.extractall(tmp_dir)
+
+        # Check if there's a single root folder and flatten if needed
+        items = os.listdir(tmp_dir)
+        if len(items) == 1 and os.path.isdir(os.path.join(tmp_dir, items[0])):
+            inner_dir = os.path.join(tmp_dir, items[0])
+            temp_move = f"{tmp_dir}_temp"
+            shutil.move(inner_dir, temp_move)
+            shutil.rmtree(tmp_dir)
+            shutil.move(temp_move, tmp_dir)
+
+        # Upload files to GitHub
+        uploaded_files = []
+        failed_files = []
+        
+        for root, _, files in os.walk(tmp_dir):
+            for file in files:
+                full = os.path.join(root, file)
+                rel_path = os.path.relpath(full, tmp_dir).replace("\\", "/")
+                github_path = f"{slug}/{rel_path}"
+                
+                try:
+                    with open(full, "rb") as f:
+                        file_content = base64.b64encode(f.read()).decode()
+                        result = upload_file(github_path, file_content)
+                        
+                        if result.get("success"):
+                            uploaded_files.append(github_path)
+                        else:
+                            failed_files.append(github_path)
+                            
+                except Exception as e:
+                    failed_files.append(github_path)
+
+        # Clean up temporary files
+        shutil.rmtree(tmp_dir)
+        os.remove(zip_path)
+
+        if failed_files:
+            return False, f"Failed to upload {len(failed_files)} file(s)"
+        
+        if not uploaded_files:
+            return False, "No files were uploaded to GitHub"
+
+        # Update or add to database
+        url = f"{BASE_URL}/{slug}/index.html"
+        game_data = {
+            "title": title,
+            "titleNormalized": title.lower(),
+            "slug": slug,
+            "categoryId": category_id,
+            "url": url,
+            "published": False
+        }
+        
+        if game_exists:
+            # Update existing game
+            db.collection("games").document(existing_games[0].id).update(game_data)
+            return True, f"Replaced with {len(uploaded_files)} file(s)"
+        else:
+            # Add new game
+            db.collection("games").add(game_data)
+            return True, f"Uploaded {len(uploaded_files)} file(s)"
+            
+    except Exception as e:
+        # Clean up if error occurs
+        if 'tmp_dir' in locals() and os.path.exists(tmp_dir):
+            shutil.rmtree(tmp_dir)
+        if 'zip_path' in locals() and os.path.exists(zip_path):
+            os.remove(zip_path)
+        return False, str(e)
+
+# =====================================================
+# UPLOAD GAME (SINGLE & BULK)
+# =====================================================
+st.markdown('<div class="section-header">⬆️ Upload Games</div>', unsafe_allow_html=True)
 
 with st.container():
     st.markdown('<div class="custom-card">', unsafe_allow_html=True)
     
-    col1, col2 = st.columns([2, 1])
+    # Toggle between single and bulk upload
+    upload_mode = st.radio("Upload Mode", ["Single Game", "Bulk Upload"], horizontal=True)
     
-    with col1:
-        title = st.text_input("Game Title", placeholder="Enter game title")
-        zip_file = st.file_uploader("Game ZIP File", type=["zip"], help="Upload a ZIP file containing your game")
+    if upload_mode == "Single Game":
+        col1, col2 = st.columns([2, 1])
+        
+        with col1:
+            title = st.text_input("Game Title", placeholder="Enter game title")
+            zip_file = st.file_uploader("Game ZIP File", type=["zip"], help="Upload a ZIP file containing your game")
+        
+        with col2:
+            category_id = st.selectbox(
+                "Category",
+                options=list(categories.keys()),
+                format_func=lambda x: categories[x] if x in categories else "Uncategorized"
+            )
+            st.markdown("<br>", unsafe_allow_html=True)
+            upload_btn = st.button("🚀 Upload Game", use_container_width=True, type="primary")
     
-    with col2:
-        category_id = st.selectbox(
-            "Category",
-            options=list(categories.keys()),
-            format_func=lambda x: categories[x] if x in categories else "Uncategorized"
-        )
-        st.markdown("<br>", unsafe_allow_html=True)
-        upload_btn = st.button("🚀 Upload Game", use_container_width=True, type="primary")
+    else:  # Bulk Upload
+        st.info("📦 Bulk upload multiple games at once. If a game with the same title exists, it will be replaced.")
+        
+        col1, col2 = st.columns([2, 1])
+        
+        with col1:
+            zip_files = st.file_uploader(
+                "Game ZIP Files", 
+                type=["zip"], 
+                accept_multiple_files=True,
+                help="Upload multiple ZIP files. Each file name will be used as the game title (e.g., 'My Game.zip' → 'My Game')"
+            )
+        
+        with col2:
+            category_id = st.selectbox(
+                "Category for all games",
+                options=list(categories.keys()),
+                format_func=lambda x: categories[x] if x in categories else "Uncategorized",
+                key="bulk_category"
+            )
+            st.markdown("<br>", unsafe_allow_html=True)
+            upload_btn = st.button("🚀 Upload All Games", use_container_width=True, type="primary")
+            
+        if zip_files:
+            st.write(f"**{len(zip_files)} file(s) selected for upload**")
     
     st.markdown('</div>', unsafe_allow_html=True)
 
+# Handle upload button click
 if upload_btn:
-    if not title or not zip_file:
-        st.error("❌ Title and ZIP file are required")
-        st.stop()
+    if upload_mode == "Single Game":
+        # Single game upload
+        if not title or not zip_file:
+            st.error("❌ Title and ZIP file are required")
+            st.stop()
 
-    titles = [d.to_dict().get("title", "").lower() for d in db.collection("games").stream()]
-    if title.lower() in titles:
-        st.error("❌ A game with this title already exists")
-        st.stop()
-
-    with st.spinner("⏳ Uploading game... Please wait"):
-        try:
-            slug = slugify(title)
+        with st.spinner(f"⏳ Processing '{title}'..."):
+            success, message = process_single_game(title, zip_file.read(), category_id)
             
-            # Ensure tmp directory exists first
-            if not os.path.exists("tmp"):
-                os.makedirs("tmp")
+            if success:
+                st.success(f"✅ {title}: {message}")
+                st.balloons()
+                st.rerun()
+            else:
+                st.error(f"❌ {title}: {message}")
+    
+    else:
+        # Bulk upload
+        if not zip_files:
+            st.error("❌ Please select at least one ZIP file")
+            st.stop()
+        
+        st.markdown("---")
+        st.markdown("### 📊 Bulk Upload Progress")
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        results = {
+            "success": [],
+            "failed": [],
+            "replaced": []
+        }
+        
+        for idx, zip_file in enumerate(zip_files):
+            # Extract title from filename (remove .zip extension)
+            title = os.path.splitext(zip_file.name)[0]
             
-            tmp_dir = f"tmp/{slug}"
-            os.makedirs(tmp_dir, exist_ok=True)
-
-            # Extract ZIP file
-            zip_path = f"{tmp_dir}.zip"
-            with open(zip_path, "wb") as f:
-                f.write(zip_file.read())
-
-            with zipfile.ZipFile(zip_path) as z:
-                z.extractall(tmp_dir)
-
-            # Check if there's a single root folder and flatten if needed
-            items = os.listdir(tmp_dir)
-            if len(items) == 1 and os.path.isdir(os.path.join(tmp_dir, items[0])):
-                # Single folder inside, move contents up one level
-                inner_dir = os.path.join(tmp_dir, items[0])
-                temp_move = f"{tmp_dir}_temp"
-                shutil.move(inner_dir, temp_move)
-                shutil.rmtree(tmp_dir)
-                shutil.move(temp_move, tmp_dir)
-
-            # Upload files to GitHub
-            uploaded_files = []
-            failed_files = []
-            error_details = []
+            status_text.text(f"Processing {idx + 1}/{len(zip_files)}: {title}")
             
-            for root, _, files in os.walk(tmp_dir):
-                for file in files:
-                    full = os.path.join(root, file)
-                    rel_path = os.path.relpath(full, tmp_dir).replace("\\", "/")
-                    github_path = f"{slug}/{rel_path}"
-                    
-                    try:
-                        with open(full, "rb") as f:
-                            file_content = base64.b64encode(f.read()).decode()
-                            file_size = os.path.getsize(full)
-                            
-                            st.write(f"📤 Uploading: {github_path} ({file_size:,} bytes)")
-                            
-                            result = upload_file(github_path, file_content)
-                            
-                            st.write(f"Result: {result}")
-                            
-                            if result.get("success"):
-                                uploaded_files.append(github_path)
-                                st.success(f"✅ {github_path}")
-                            else:
-                                failed_files.append(github_path)
-                                error_msg = result.get("message", "Unknown error")
-                                error_details.append(f"{github_path}: {error_msg}")
-                                st.error(f"❌ {github_path}: {error_msg}")
-                                
-                    except Exception as e:
-                        error_msg = f"{github_path}: {str(e)}"
-                        st.error(f"Exception uploading {github_path}: {str(e)}")
-                        failed_files.append(github_path)
-                        error_details.append(error_msg)
-
-            # Check if files were uploaded successfully
-            if failed_files:
-                st.error(f"❌ Failed to upload {len(failed_files)} file(s) to GitHub")
-                
-                st.write("### Failed Files:")
-                for fail in failed_files:
-                    st.write(f"- {fail}")
-                
-                st.write("### Error Details:")
-                for detail in error_details:
-                    st.code(detail)
-                
-                st.write("---")
-                st.write("### Troubleshooting Checklist:")
-                st.write("✓ Check your GITHUB_TOKEN has write permissions")
-                st.write("✓ Verify GITHUB_OWNER and GITHUB_REPO are correct")
-                st.write("✓ Ensure GITHUB_BRANCH exists in your repository")
-                st.write("✓ Check if file path already exists (will return 422)")
-                
-                # Clean up
-                shutil.rmtree(tmp_dir)
-                os.remove(zip_path)
-                st.stop()
+            # Check if game already exists
+            existing = list(db.collection("games").where("titleNormalized", "==", title.lower()).stream())
+            was_existing = len(existing) > 0
             
-            if not uploaded_files:
-                st.error("❌ No files were uploaded to GitHub. Please check your GitHub configuration.")
-                
-                # Clean up
-                shutil.rmtree(tmp_dir)
-                os.remove(zip_path)
-                st.stop()
-
-            # Add to database only after successful GitHub upload
-            url = f"{BASE_URL}/{slug}/index.html"
-
-            db.collection("games").add({
-                "title": title,
-                "titleNormalized": title.lower(),
-                "slug": slug,
-                "categoryId": category_id,
-                "url": url,
-                "published": False
-            })
-
-            # Clean up temporary files
-            shutil.rmtree(tmp_dir)
-            os.remove(zip_path)
-
-            st.success(f"✅ Game uploaded successfully! {len(uploaded_files)} files uploaded to GitHub.")
+            success, message = process_single_game(title, zip_file.read(), category_id, zip_file.name)
+            
+            if success:
+                if was_existing:
+                    results["replaced"].append(f"{title}: {message}")
+                    st.info(f"🔄 {title}: {message}")
+                else:
+                    results["success"].append(f"{title}: {message}")
+                    st.success(f"✅ {title}: {message}")
+            else:
+                results["failed"].append(f"{title}: {message}")
+                st.error(f"❌ {title}: {message}")
+            
+            progress_bar.progress((idx + 1) / len(zip_files))
+        
+        status_text.text("✅ Bulk upload completed!")
+        
+        # Summary
+        st.markdown("---")
+        st.markdown("### 📈 Upload Summary")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("✅ New Games", len(results["success"]))
+        with col2:
+            st.metric("🔄 Replaced", len(results["replaced"]))
+        with col3:
+            st.metric("❌ Failed", len(results["failed"]))
+        
+        if results["success"] or results["replaced"]:
             st.balloons()
-            
-        except Exception as e:
-            st.error(f"❌ Error during upload: {str(e)}")
-            # Clean up if error occurs
-            if os.path.exists(tmp_dir):
-                shutil.rmtree(tmp_dir)
-            if os.path.exists(zip_path):
-                os.remove(zip_path)
+        
+        # Show details if there were failures
+        if results["failed"]:
+            with st.expander("❌ View Failed Uploads"):
+                for fail in results["failed"]:
+                    st.text(fail)
+        
+        # Rerun to refresh the game list
+        st.rerun()
 
 # =====================================================
 # SEARCH & PAGINATION
@@ -474,7 +568,7 @@ if total > 0:
     st.markdown('<div class="pagination">', unsafe_allow_html=True)
     p1, p2, p3 = st.columns([1, 2, 1])
 
-    if p1.button("⬅ Previous", disabled=st.session_state.page == 1, use_container_width=True):
+    if p1.button("⬅️ Previous", disabled=st.session_state.page == 1, use_container_width=True):
         st.session_state.page -= 1
         st.rerun()
 
@@ -483,7 +577,7 @@ if total > 0:
         unsafe_allow_html=True
     )
 
-    if p3.button("Next ➡", disabled=st.session_state.page == total_pages, use_container_width=True):
+    if p3.button("Next ➡️", disabled=st.session_state.page == total_pages, use_container_width=True):
         st.session_state.page += 1
         st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
@@ -494,7 +588,7 @@ if total > 0:
 selected = set()
 
 if total == 0:
-    st.info("📭 No games found. Upload your first game to get started!")
+    st.info("🔭 No games found. Upload your first game to get started!")
 else:
     for g in page_docs:
         data = g.to_dict()
