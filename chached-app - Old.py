@@ -7,8 +7,6 @@ from settings import ADMIN_PASSWORD, BASE_URL
 from datetime import datetime, timedelta
 import time
 import uuid
-from google.cloud.firestore import SERVER_TIMESTAMP
-
 
 
 # =====================================================
@@ -387,35 +385,36 @@ with st.expander("📂 Manage Categories", expanded=False):
 # HELPER FUNCTION FOR GAME UPLOAD
 # =====================================================
 def process_single_game(title, zip_file_content, category_id, zip_filename=""):
-    """
-    Upload a single game safely.
-    - No overwrite
-    - Duplicate title blocked
-    - Unique slug per game
-    """
+    """Process and upload a single game. Returns (success, message)"""
     try:
-        title_clean = title.strip()
-        title_norm = title_clean.lower()
-
-        # ---------------- DUPLICATE CHECK ----------------
-        duplicates = [
-            g for g in all_games
-            if g.to_dict().get("titleNormalized") == title_norm
-        ]
-
-        if duplicates:
-            return False, f"Duplicate title '{title_clean}' already exists. Upload blocked."
-
-        # ---------------- UNIQUE SLUG ----------------
-        #unique_id = uuid.uuid4().hex[:8]
-        #slug = f"{slugify(title_clean)}-{unique_id}"
-        slug = f"{slugify(title_clean)}"
-
-        # ---------------- TEMP DIR ----------------
-        os.makedirs("tmp", exist_ok=True)
+        slug = slugify(title)
+        
+        # Check if game exists - use cached data
+        existing_games = [g for g in all_games if g.to_dict().get("titleNormalized") == title.lower()]
+        game_exists = len(existing_games) > 0
+        
+        if game_exists:
+            st.warning(f"⚠️ Game '{title}' already exists. Replacing...")
+            existing_game = existing_games[0]
+            existing_slug = existing_game.to_dict().get("slug", slug)
+            
+            # Delete old files from GitHub
+            try:
+                old_files = list_files(existing_slug)
+                for f in old_files:
+                    delete_file(f["path"], f["sha"])
+                st.info(f"🗑️ Deleted {len(old_files)} old file(s) for '{title}'")
+            except Exception as e:
+                st.warning(f"⚠️ Could not delete old files: {str(e)}")
+        
+        # Ensure tmp directory exists
+        if not os.path.exists("tmp"):
+            os.makedirs("tmp")
+        
         tmp_dir = f"tmp/{slug}"
         os.makedirs(tmp_dir, exist_ok=True)
 
+        # Extract ZIP file
         zip_path = f"{tmp_dir}.zip"
         with open(zip_path, "wb") as f:
             f.write(zip_file_content)
@@ -423,61 +422,77 @@ def process_single_game(title, zip_file_content, category_id, zip_filename=""):
         with zipfile.ZipFile(zip_path) as z:
             z.extractall(tmp_dir)
 
-        # Flatten single root folder
+        # Check if there's a single root folder and flatten if needed
         items = os.listdir(tmp_dir)
         if len(items) == 1 and os.path.isdir(os.path.join(tmp_dir, items[0])):
-            inner = os.path.join(tmp_dir, items[0])
-            for item in os.listdir(inner):
-                shutil.move(os.path.join(inner, item), tmp_dir)
-            shutil.rmtree(inner)
+            inner_dir = os.path.join(tmp_dir, items[0])
+            temp_move = f"{tmp_dir}_temp"
+            shutil.move(inner_dir, temp_move)
+            shutil.rmtree(tmp_dir)
+            shutil.move(temp_move, tmp_dir)
 
-        # ---------------- UPLOAD TO GITHUB ----------------
+        # Upload files to GitHub
         uploaded_files = []
-
+        failed_files = []
+        
         for root, _, files in os.walk(tmp_dir):
             for file in files:
                 full = os.path.join(root, file)
-                rel = os.path.relpath(full, tmp_dir).replace("\\", "/")
-                github_path = f"{slug}/{rel}"
+                rel_path = os.path.relpath(full, tmp_dir).replace("\\", "/")
+                github_path = f"{slug}/{rel_path}"
+                
+                try:
+                    with open(full, "rb") as f:
+                        file_content = base64.b64encode(f.read()).decode()
+                        result = upload_file(github_path, file_content)
+                        
+                        if result.get("success"):
+                            uploaded_files.append(github_path)
+                        else:
+                            failed_files.append(github_path)
+                            
+                except Exception as e:
+                    failed_files.append(github_path)
 
-                with open(full, "rb") as f:
-                    content = base64.b64encode(f.read()).decode()
-                    result = upload_file(github_path, content)
+        # Clean up temporary files
+        shutil.rmtree(tmp_dir)
+        os.remove(zip_path)
 
-                if not result.get("success"):
-                    raise Exception(f"Failed uploading {github_path}")
-
-                uploaded_files.append(github_path)
-
+        if failed_files:
+            return False, f"Failed to upload {len(failed_files)} file(s)"
+        
         if not uploaded_files:
-            raise Exception("No files uploaded")
+            return False, "No files were uploaded to GitHub"
 
-        # ---------------- FIRESTORE ADD (NEVER UPDATE) ----------------
+        # Update or add to database
         url = f"{BASE_URL}/{slug}/index.html"
-
         game_data = {
             "title": title,
             "titleNormalized": title.lower(),
             "slug": slug,
             "categoryId": category_id,
             "url": url,
-            "published": True,
-             # ✅ REQUIRED FOR "NEW GAME FIRST"
-            "createdAt": SERVER_TIMESTAMP,
+            "published": True
         }
-
-        db.collection("games").add(game_data)
-        invalidate_cache("games")
-
-        return True, f"Uploaded {len(uploaded_files)} file(s)"
-
+        
+        if game_exists:
+            # Update existing game
+            db.collection("games").document(existing_games[0].id).update(game_data)
+            invalidate_cache("games")  # Invalidate games cache
+            return True, f"Replaced with {len(uploaded_files)} file(s)"
+        else:
+            # Add new game
+            db.collection("games").add(game_data)
+            invalidate_cache("games")  # Invalidate games cache
+            return True, f"Uploaded {len(uploaded_files)} file(s)"
+            
     except Exception as e:
-        if os.path.exists(tmp_dir):
+        # Clean up if error occurs
+        if 'tmp_dir' in locals() and os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir)
-        if os.path.exists(zip_path):
+        if 'zip_path' in locals() and os.path.exists(zip_path):
             os.remove(zip_path)
         return False, str(e)
-
 
 # =====================================================
 # UPLOAD GAME (SINGLE & BULK)
@@ -507,7 +522,7 @@ with st.container():
             upload_btn = st.button("🚀 Upload Game", use_container_width=True, type="primary")
     
     else:  # Bulk Upload
-        st.info("📦 Bulk upload multiple games at once. Duplicate titles are blocked to prevent overwrite.")
+        st.info("📦 Bulk upload multiple games at once. If a game with the same title exists, it will be replaced.")
         
         col1, col2 = st.columns([2, 1])
         
@@ -577,16 +592,7 @@ if upload_btn:
             status_text.text(f"Processing {idx + 1}/{len(zip_files)}: {title}")
             
             # Check if game already exists - use cached data
-            existing = [
-                g for g in all_games
-                if g.to_dict().get("titleNormalized") == title.lower()
-            ]
-
-            if existing:
-                st.error(f"❌ {title}: Duplicate title exists. Skipped.")
-                continue
-    
-
+            existing = [g for g in all_games if g.to_dict().get("titleNormalized") == title.lower()]
             was_existing = len(existing) > 0
             
             success, message = process_single_game(title, zip_file.read(), category_id, zip_file.name)
